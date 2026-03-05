@@ -1,19 +1,48 @@
 #include "sparrow_ipc/flatbuffer_utils.hpp"
 
+#include <functional>
 #include <string>
 
 #include <sparrow/utils/ranges.hpp>
 
 #include "compression_impl.hpp"
+#include "sparrow_ipc/dictionary_utils.hpp"
 #include "sparrow_ipc/magic_values.hpp"
 
 namespace sparrow_ipc
 {
+    namespace
+    {
+        ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
+        create_children_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const ArrowSchema& arrow_schema,
+            int64_t& next_fallback_dictionary_id
+        );
+
+        ::flatbuffers::Offset<org::apache::arrow::flatbuf::Field> create_field_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const ArrowSchema& arrow_schema,
+            std::optional<std::string_view> name_override,
+            std::optional<int64_t> dictionary_id_override,
+            int64_t& next_fallback_dictionary_id
+        );
+
+        ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
+        create_children_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const sparrow::record_batch& record_batch,
+            int64_t& next_fallback_dictionary_id
+        );
+    }
+
     namespace details
     {
-        std::size_t get_nb_buffers_to_process(const std::string_view& format, const std::size_t orig_buffers_size)
+        std::size_t
+        get_nb_buffers_to_process(const std::string_view& format, const std::size_t orig_buffers_size)
         {
-            // If the array data type is a view type, we should not consider the last buffer (corresponding to the variadic buffer sizes)
+            // If the array data type is a view type, we should not consider the last buffer (corresponding to
+            // the variadic buffer sizes)
             if (const auto type = sparrow::format_to_data_type(format);
                 type == sparrow::data_type::STRING_VIEW || type == sparrow::data_type::BINARY_VIEW)
             {
@@ -26,11 +55,11 @@ namespace sparrow_ipc
 
     namespace
     {
-        std::pair<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>>
-        get_flatbuffer_timestamp_type(
+        std::pair<org::apache::arrow::flatbuf::Type, flatbuffers::Offset<void>> get_flatbuffer_timestamp_type(
             flatbuffers::FlatBufferBuilder& builder,
             std::string_view format_str,
-            org::apache::arrow::flatbuf::TimeUnit time_unit)
+            org::apache::arrow::flatbuf::TimeUnit time_unit
+        )
         {
             const auto timezone = utils::get_substr_after_separator(format_str, ":");
             flatbuffers::Offset<flatbuffers::String> timezone_offset = 0;
@@ -41,7 +70,8 @@ namespace sparrow_ipc
             const auto timestamp_type = org::apache::arrow::flatbuf::CreateTimestamp(
                 builder,
                 time_unit,
-                timezone_offset);
+                timezone_offset
+            );
             return {org::apache::arrow::flatbuf::Type::Timestamp, timestamp_type.Union()};
         }
     }
@@ -464,32 +494,130 @@ namespace sparrow_ipc
     ::flatbuffers::Offset<org::apache::arrow::flatbuf::Field> create_field(
         flatbuffers::FlatBufferBuilder& builder,
         const ArrowSchema& arrow_schema,
-        std::optional<std::string_view> name_override
+        std::optional<std::string_view> name_override,
+        std::optional<int64_t> dictionary_id_override
     )
     {
-        flatbuffers::Offset<flatbuffers::String>
-            fb_name_offset = name_override.has_value()
-                                 ? builder.CreateString(name_override.value())
-                                 : (arrow_schema.name == nullptr ? 0 : builder.CreateString(arrow_schema.name));
-        const auto [type_enum, type_offset] = get_flatbuffer_type(builder, arrow_schema.format);
+        int64_t next_fallback_dictionary_id = 0;
+        return create_field_impl(
+            builder,
+            arrow_schema,
+            name_override,
+            dictionary_id_override,
+            next_fallback_dictionary_id
+        );
+    }
+
+    namespace
+    {
+        ::flatbuffers::Offset<org::apache::arrow::flatbuf::Field> create_field_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const ArrowSchema& arrow_schema,
+            std::optional<std::string_view> name_override,
+            std::optional<int64_t> dictionary_id_override,
+            int64_t& next_fallback_dictionary_id
+        )
+        {
+        const bool is_dictionary_encoded = arrow_schema.dictionary != nullptr;
+        const ArrowSchema& value_schema = is_dictionary_encoded ? *arrow_schema.dictionary : arrow_schema;
+
+        // Determine the field name to use
+        const std::string field_name = name_override.has_value() 
+            ? std::string(name_override.value())
+            : (arrow_schema.name != nullptr ? arrow_schema.name : "field");
+
+        flatbuffers::Offset<flatbuffers::String> fb_name_offset = builder.CreateString(field_name);
+        const auto [type_enum, type_offset] = get_flatbuffer_type(builder, value_schema.format);
         auto fb_metadata_offset = create_metadata(builder, arrow_schema);
-        const auto children = create_children(builder, arrow_schema);
+
+        // Handle dictionary encoding
+        flatbuffers::Offset<org::apache::arrow::flatbuf::DictionaryEncoding> dictionary_offset = 0;
+        if (is_dictionary_encoded)
+        {
+            // Extract dictionary metadata
+            const auto dict_metadata = parse_dictionary_metadata(arrow_schema);
+            const bool is_ordered = dict_metadata.is_ordered;
+
+            // If no ID in metadata, use the provided override or a traversal-based incremental fallback ID
+            const int64_t fallback_id = dictionary_id_override.value_or(next_fallback_dictionary_id++);
+            const int64_t dict_id = dict_metadata.id.value_or(fallback_id);
+
+            // Create index type from the schema's format (the indices type)
+            const auto index_data_type = sparrow::format_to_data_type(arrow_schema.format);
+            flatbuffers::Offset<org::apache::arrow::flatbuf::Int> index_type_offset;
+
+            switch (index_data_type)
+            {
+                case sparrow::data_type::UINT8:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 8, false);
+                    break;
+                case sparrow::data_type::INT8:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 8, true);
+                    break;
+                case sparrow::data_type::UINT16:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 16, false);
+                    break;
+                case sparrow::data_type::INT16:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 16, true);
+                    break;
+                case sparrow::data_type::UINT32:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 32, false);
+                    break;
+                case sparrow::data_type::INT32:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 32, true);
+                    break;
+                case sparrow::data_type::UINT64:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 64, false);
+                    break;
+                case sparrow::data_type::INT64:
+                    index_type_offset = org::apache::arrow::flatbuf::CreateInt(builder, 64, true);
+                    break;
+                default:
+                    throw std::runtime_error("Dictionary index type must be an integer type");
+            }
+
+            // Create DictionaryEncoding
+            dictionary_offset = org::apache::arrow::flatbuf::CreateDictionaryEncoding(
+                builder,
+                dict_id,
+                index_type_offset,
+                is_ordered,
+                org::apache::arrow::flatbuf::DictionaryKind::DenseArray
+            );
+        }
+
+        const auto children = create_children_impl(builder, value_schema, next_fallback_dictionary_id);
+
         const auto fb_field = org::apache::arrow::flatbuf::CreateField(
             builder,
             fb_name_offset,
             (arrow_schema.flags & static_cast<int64_t>(sparrow::ArrowFlag::NULLABLE)) != 0,
             type_enum,
             type_offset,
-            0,  // TODO: support dictionary
+            dictionary_offset,
             children,
             fb_metadata_offset
         );
         return fb_field;
     }
+    }
 
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
     create_children(flatbuffers::FlatBufferBuilder& builder, const ArrowSchema& arrow_schema)
     {
+        int64_t next_fallback_dictionary_id = 0;
+        return create_children_impl(builder, arrow_schema, next_fallback_dictionary_id);
+    }
+
+    namespace
+    {
+        ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
+        create_children_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const ArrowSchema& arrow_schema,
+            int64_t& next_fallback_dictionary_id
+        )
+        {
         std::vector<flatbuffers::Offset<org::apache::arrow::flatbuf::Field>> children_vec;
         children_vec.reserve(arrow_schema.n_children);
         for (size_t i = 0; i < arrow_schema.n_children; ++i)
@@ -499,15 +627,41 @@ namespace sparrow_ipc
                 throw std::invalid_argument("ArrowSchema has null child pointer");
             }
             const auto& child = *arrow_schema.children[i];
-            flatbuffers::Offset<org::apache::arrow::flatbuf::Field> field = create_field(builder, child);
+            const std::string field_name = child.name != nullptr
+                                               ? child.name
+                                               : (arrow_schema.name != nullptr ? std::string(arrow_schema.name)
+                                                                               : "base")
+                                                     + "_child_" + std::to_string(i);
+            flatbuffers::Offset<org::apache::arrow::flatbuf::Field>
+                field = create_field_impl(
+                    builder,
+                    child,
+                    field_name,
+                    std::nullopt,
+                    next_fallback_dictionary_id
+                );
             children_vec.emplace_back(field);
         }
         return children_vec.empty() ? 0 : builder.CreateVector(children_vec);
+    }
     }
 
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
     create_children(flatbuffers::FlatBufferBuilder& builder, const sparrow::record_batch& record_batch)
     {
+        int64_t next_fallback_dictionary_id = 0;
+        return create_children_impl(builder, record_batch, next_fallback_dictionary_id);
+    }
+
+    namespace
+    {
+        ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<org::apache::arrow::flatbuf::Field>>>
+        create_children_impl(
+            flatbuffers::FlatBufferBuilder& builder,
+            const sparrow::record_batch& record_batch,
+            int64_t& next_fallback_dictionary_id
+        )
+        {
         const auto& columns = record_batch.columns();
         std::vector<flatbuffers::Offset<org::apache::arrow::flatbuf::Field>> children_vec;
         children_vec.reserve(columns.size());
@@ -515,14 +669,19 @@ namespace sparrow_ipc
         for (size_t i = 0; i < columns.size(); ++i)
         {
             const auto& arrow_schema = sparrow::detail::array_access::get_arrow_proxy(columns[i]).schema();
-            flatbuffers::Offset<org::apache::arrow::flatbuf::Field> field = create_field(
-                builder,
-                arrow_schema,
-                names[i]
-            );
+            const auto& field_name = names[i];
+            flatbuffers::Offset<org::apache::arrow::flatbuf::Field>
+                field = create_field_impl(
+                    builder,
+                    arrow_schema,
+                    field_name,
+                    std::nullopt,
+                    next_fallback_dictionary_id
+                );
             children_vec.emplace_back(field);
         }
         return children_vec.empty() ? 0 : builder.CreateVector(children_vec);
+    }
     }
 
     flatbuffers::FlatBufferBuilder get_schema_message_builder(const sparrow::record_batch& record_batch)
@@ -659,22 +818,29 @@ namespace sparrow_ipc
             }
 
             total_size = sparrow::ranges::accumulate(
-                buffers | std::views::take(nb_buffers), int64_t{0},
-                [&](int64_t acc, const auto& buffer) {
-                    return acc + utils::align_to_8(get_compressed_size(
-                        compression.value(),
-                        std::span<const uint8_t>(buffer.data(), buffer.size()),
-                        cache.value().get()
-                    ));
-                });
+                buffers | std::views::take(nb_buffers),
+                int64_t{0},
+                [&](int64_t acc, const auto& buffer)
+                {
+                    return acc
+                           + utils::align_to_8(get_compressed_size(
+                               compression.value(),
+                               std::span<const uint8_t>(buffer.data(), buffer.size()),
+                               cache.value().get()
+                           ));
+                }
+            );
         }
         else
         {
             total_size = sparrow::ranges::accumulate(
-                buffers | std::views::take(nb_buffers), int64_t{0},
-                [&](int64_t acc, const auto& buffer) {
+                buffers | std::views::take(nb_buffers),
+                int64_t{0},
+                [&](int64_t acc, const auto& buffer)
+                {
                     return acc + utils::align_to_8(buffer.size());
-                });
+                }
+            );
         }
 
         for (const auto& child : arrow_proxy.children())
@@ -703,6 +869,12 @@ namespace sparrow_ipc
 
     namespace
     {
+        struct record_batch_payload
+        {
+            flatbuffers::Offset<org::apache::arrow::flatbuf::RecordBatch> record_batch_offset = 0;
+            int64_t body_size = 0;
+        };
+
         std::vector<int64_t> get_variadic_buffer_counts(const sparrow::record_batch& record_batch)
         {
             std::vector<int64_t> counts;
@@ -714,9 +886,12 @@ namespace sparrow_ipc
 
                 if (type == sparrow::data_type::BINARY_VIEW || type == sparrow::data_type::STRING_VIEW)
                 {
-                    // n_buffers includes the following buffers: validity buffer, views buffer, data buffers (variadic buffers if present for strings > 12 bytes) and buffer for variadic buffer sizes
+                    // n_buffers includes the following buffers: validity buffer, views buffer, data
+                    // buffers (variadic buffers if present for strings > 12 bytes) and buffer for
+                    // variadic buffer sizes
                     int64_t n_buffers = proxy.n_buffers();
-                    // The variable size binary view array should at least contain validity, views and variadic buffers size
+                    // The variable size binary view array should at least contain validity, views and
+                    // variadic buffers size
                     if (n_buffers <= 2)
                     {
                         throw std::runtime_error(
@@ -732,54 +907,110 @@ namespace sparrow_ipc
             }
             return counts;
         }
+
+        record_batch_payload create_record_batch_payload(
+            flatbuffers::FlatBufferBuilder& builder,
+            const sparrow::record_batch& record_batch,
+            std::optional<CompressionType> compression,
+            std::optional<std::reference_wrapper<CompressionCache>> cache
+        )
+        {
+            flatbuffers::Offset<org::apache::arrow::flatbuf::BodyCompression> compression_offset = 0;
+            std::optional<std::vector<org::apache::arrow::flatbuf::Buffer>> compressed_buffers;
+            if (compression)
+            {
+                if (!cache)
+                {
+                    throw std::invalid_argument("Compression type set but no cache is given.");
+                }
+                compressed_buffers = get_compressed_buffers(record_batch, compression.value(), cache.value().get());
+                compression_offset = org::apache::arrow::flatbuf::CreateBodyCompression(
+                    builder,
+                    details::to_fb_compression_type(compression.value()),
+                    org::apache::arrow::flatbuf::BodyCompressionMethod::BUFFER
+                );
+            }
+
+            const auto& buffers = compressed_buffers ? *compressed_buffers : get_buffers(record_batch);
+            const std::vector<org::apache::arrow::flatbuf::FieldNode> nodes = create_fieldnodes(record_batch);
+            const auto variadic_counts = get_variadic_buffer_counts(record_batch);
+
+            auto nodes_offset = builder.CreateVectorOfStructs(nodes);
+            auto buffers_offset = builder.CreateVectorOfStructs(buffers);
+            auto variadic_counts_offset = builder.CreateVector(variadic_counts);
+
+            const auto record_batch_offset = org::apache::arrow::flatbuf::CreateRecordBatch(
+                builder,
+                static_cast<int64_t>(record_batch.nb_rows()),
+                nodes_offset,
+                buffers_offset,
+                compression_offset,
+                variadic_counts_offset
+            );
+
+            return {
+                record_batch_offset,
+                calculate_body_size(record_batch, compression, cache)
+            };
+        }
     }
 
-    flatbuffers::FlatBufferBuilder get_record_batch_message_builder(const sparrow::record_batch& record_batch,
-                                                                    std::optional<CompressionType> compression,
-                                                                    std::optional<std::reference_wrapper<CompressionCache>> cache)
+    flatbuffers::FlatBufferBuilder get_record_batch_message_builder(
+        const sparrow::record_batch& record_batch,
+        std::optional<CompressionType> compression,
+        std::optional<std::reference_wrapper<CompressionCache>> cache
+    )
     {
         flatbuffers::FlatBufferBuilder record_batch_builder;
-        flatbuffers::Offset<org::apache::arrow::flatbuf::BodyCompression> compression_offset = 0;
-        std::optional<std::vector<org::apache::arrow::flatbuf::Buffer>> compressed_buffers;
-        if (compression)
-        {
-            if (!cache)
-            {
-                throw std::invalid_argument("Compression type set but no cache is given.");
-            }
-            compressed_buffers = get_compressed_buffers(record_batch, compression.value(), cache.value().get());
-            compression_offset = org::apache::arrow::flatbuf::CreateBodyCompression(
-                record_batch_builder,
-                details::to_fb_compression_type(compression.value()),
-                org::apache::arrow::flatbuf::BodyCompressionMethod::BUFFER
-            );
-        }
-        const auto& buffers = compressed_buffers ? *compressed_buffers : get_buffers(record_batch);
-        const std::vector<org::apache::arrow::flatbuf::FieldNode> nodes = create_fieldnodes(record_batch);
-        const auto variadic_counts = get_variadic_buffer_counts(record_batch);
-        auto nodes_offset = record_batch_builder.CreateVectorOfStructs(nodes);
-        auto buffers_offset = record_batch_builder.CreateVectorOfStructs(buffers);
-        auto variadic_counts_offset = record_batch_builder.CreateVector(variadic_counts);
-        const auto record_batch_offset = org::apache::arrow::flatbuf::CreateRecordBatch(
-            record_batch_builder,
-            static_cast<int64_t>(record_batch.nb_rows()),
-            nodes_offset,
-            buffers_offset,
-            compression_offset,
-            variadic_counts_offset
-        );
-
-        const int64_t body_size = calculate_body_size(record_batch, compression, cache);
+        const auto payload = create_record_batch_payload(record_batch_builder, record_batch, compression, cache);
         const auto record_batch_message_offset = org::apache::arrow::flatbuf::CreateMessage(
             record_batch_builder,
             org::apache::arrow::flatbuf::MetadataVersion::V5,
             org::apache::arrow::flatbuf::MessageHeader::RecordBatch,
-            record_batch_offset.Union(),
-            body_size,  // body length
+            payload.record_batch_offset.Union(),
+            payload.body_size,  // body length
             0           // custom metadata
         );
         record_batch_builder.Finish(record_batch_message_offset);
         return record_batch_builder;
+    }
+
+    flatbuffers::FlatBufferBuilder get_dictionary_batch_message_builder(
+        int64_t dictionary_id,
+        const sparrow::record_batch& record_batch,
+        bool is_delta,
+        std::optional<CompressionType> compression,
+        std::optional<std::reference_wrapper<CompressionCache>> cache
+    )
+    {
+        if (record_batch.nb_columns() != 1)
+        {
+            throw std::invalid_argument("Dictionary batch must have exactly one column");
+        }
+
+        flatbuffers::FlatBufferBuilder dict_batch_builder;
+        const auto payload = create_record_batch_payload(dict_batch_builder, record_batch, compression, cache);
+
+        // Create the DictionaryBatch wrapping the RecordBatch
+        const auto dictionary_batch_offset = org::apache::arrow::flatbuf::CreateDictionaryBatch(
+            dict_batch_builder,
+            dictionary_id,
+            payload.record_batch_offset,
+            is_delta
+        );
+
+        // Create the Message with DictionaryBatch as the header
+        const auto dictionary_batch_message_offset = org::apache::arrow::flatbuf::CreateMessage(
+            dict_batch_builder,
+            org::apache::arrow::flatbuf::MetadataVersion::V5,
+            org::apache::arrow::flatbuf::MessageHeader::DictionaryBatch,
+            dictionary_batch_offset.Union(),
+            payload.body_size,
+            0  // custom metadata
+        );
+
+        dict_batch_builder.Finish(dictionary_batch_message_offset);
+        return dict_batch_builder;
     }
 
     const org::apache::arrow::flatbuf::Footer* get_footer_from_file_data(std::span<const uint8_t> file_data)

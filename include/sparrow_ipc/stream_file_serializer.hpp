@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstddef>
-#include <numeric>
 #include <optional>
 #include <vector>
 
@@ -10,9 +9,12 @@
 #include "sparrow_ipc/any_output_stream.hpp"
 #include "sparrow_ipc/compression.hpp"
 #include "sparrow_ipc/config/config.hpp"
+#include "sparrow_ipc/dictionary_iteration.hpp"
+#include "sparrow_ipc/dictionary_tracker.hpp"
 #include "sparrow_ipc/magic_values.hpp"
 #include "sparrow_ipc/serialize.hpp"
 #include "sparrow_ipc/serialize_utils.hpp"
+#include "sparrow_ipc/serializer_reserve.hpp"
 
 namespace sparrow_ipc
 {
@@ -23,9 +25,9 @@ namespace sparrow_ipc
      */
     struct record_batch_block
     {
-        int64_t offset;          ///< Offset from the start of the file to the record batch message
-        int32_t metadata_length; ///< Length of the metadata (FlatBuffer message)
-        int64_t body_length;     ///< Length of the record batch body (data buffers)
+        int64_t offset;           ///< Offset from the start of the file to the record batch message
+        int32_t metadata_length;  ///< Length of the metadata (FlatBuffer message)
+        int64_t body_length;      ///< Length of the record batch body (data buffers)
     };
 
     /**
@@ -38,10 +40,11 @@ namespace sparrow_ipc
      */
     SPARROW_IPC_API size_t write_footer(
         const sparrow::record_batch& record_batch,
+        const std::vector<record_batch_block>& dictionary_blocks,
         const std::vector<record_batch_block>& record_batch_blocks,
         any_output_stream& stream
     );
-    
+
     /**
      * @brief Deserializes Arrow IPC file format into a vector of record batches.
      *
@@ -69,9 +72,9 @@ namespace sparrow_ipc
     /**
      * @brief A class for serializing Apache Arrow record batches to the IPC file format.
      *
-     * The stream_file_serializer class provides functionality to serialize single or multiple 
-     * record batches into the Arrow IPC file format suitable for storage. It ensures schema 
-     * consistency across multiple record batches and optimizes memory allocation by 
+     * The stream_file_serializer class provides functionality to serialize single or multiple
+     * record batches into the Arrow IPC file format suitable for storage. It ensures schema
+     * consistency across multiple record batches and optimizes memory allocation by
      * pre-calculating required buffer sizes.
      *
      * @details The stream_file_serializer follows the Arrow IPC file format specification:
@@ -102,7 +105,8 @@ namespace sparrow_ipc
          */
         template <writable_stream TStream>
         stream_file_serializer(TStream& stream, std::optional<CompressionType> compression = std::nullopt)
-            : m_stream(stream), m_compression(compression)
+            : m_stream(stream)
+            , m_compression(compression)
         {
         }
 
@@ -167,19 +171,18 @@ namespace sparrow_ipc
             }
 
             // NOTE `reserve_function` is making us store a cache for the compressed buffers at this level.
-            // The benefit of capacity allocation should be evaluated vs storing a cache of compressed buffers of record batches.
+            // The benefit of capacity allocation should be evaluated vs storing a cache of compressed buffers
+            // of record batches.
             const auto reserve_function = [&record_batches, &compressed_buffers_cache, this]()
             {
-                return std::accumulate(
-                           record_batches.begin(),
-                           record_batches.end(),
-                           m_stream.size(),
-                           [&compressed_buffers_cache, this](size_t acc, const sparrow::record_batch& rb)
-                           {
-                               return acc + calculate_record_batch_message_size(rb, m_compression, compressed_buffers_cache);
-                           }
-                       )
-                       + (m_schema_received ? 0 : calculate_schema_message_size(*record_batches.begin()));
+                return calculate_serializer_reserve_size(
+                    record_batches,
+                    m_stream.size(),
+                    m_schema_received,
+                    m_compression,
+                    m_dict_tracker,
+                    compressed_buffers_cache
+                );
             };
 
             m_stream.reserve(reserve_function);
@@ -198,13 +201,39 @@ namespace sparrow_ipc
                 {
                     throw std::invalid_argument("Record batch schema does not match file serializer schema");
                 }
-                
+
+                for_each_pending_dictionary(rb, m_dict_tracker, [&](const dictionary_info& dict_info)
+                {
+                    if (m_dict_tracker.is_emitted(dict_info.id) && !dict_info.is_delta)
+                    {
+                        throw std::runtime_error(
+                            "Arrow file format does not support multiple non-delta dictionary batches "
+                            "for the same dictionary id"
+                        );
+                    }
+
+                    const int64_t dict_offset = static_cast<int64_t>(m_stream.size());
+                    const auto dict_block_info = serialize_dictionary_batch(
+                        dict_info.id,
+                        dict_info.data,
+                        dict_info.is_delta,
+                        m_stream,
+                        m_compression,
+                        compressed_buffers_cache
+                    );
+                    m_dictionary_blocks.emplace_back(
+                        dict_offset,
+                        dict_block_info.metadata_length,
+                        dict_block_info.body_length
+                    );
+                });
+
                 // Offset is from the start of the file to the record batch message
                 const int64_t offset = static_cast<int64_t>(m_stream.size());
-                
+
                 // Serialize and get block info
                 const auto info = serialize_record_batch(rb, m_stream, m_compression, compressed_buffers_cache);
-                
+
                 m_record_batch_blocks.emplace_back(offset, info.metadata_length, info.body_length);
             }
         }
@@ -271,7 +300,7 @@ namespace sparrow_ipc
          * stream_file_serializer ser(stream);
          * ser << batch1 << batch2 << end_file;
          */
-        stream_file_serializer& operator<<(stream_file_serializer& (*manip)(stream_file_serializer&))
+        stream_file_serializer& operator<<(stream_file_serializer& (*manip)(stream_file_serializer&) )
         {
             return manip(*this);
         }
@@ -285,7 +314,7 @@ namespace sparrow_ipc
          * 3. Writing the footer size (int32)
          * 4. Writing the trailing magic bytes (ARROW1)
          *
-         * It can be called multiple times safely as it tracks whether the file has 
+         * It can be called multiple times safely as it tracks whether the file has
          * already been ended to prevent duplicate operations.
          *
          * @note This method is idempotent - calling it multiple times has no additional effect.
@@ -301,6 +330,8 @@ namespace sparrow_ipc
         any_output_stream m_stream;
         bool m_ended{false};
         std::optional<CompressionType> m_compression;
+        dictionary_tracker m_dict_tracker;
+        std::vector<record_batch_block> m_dictionary_blocks;
         std::vector<record_batch_block> m_record_batch_blocks;
     };
 
