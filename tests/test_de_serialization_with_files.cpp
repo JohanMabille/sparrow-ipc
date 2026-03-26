@@ -9,8 +9,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include <nlohmann/json.hpp>
-
 #include <sparrow/record_batch.hpp>
 #include <sparrow/utils/format.hpp>
 
@@ -23,14 +21,14 @@
 #include "sparrow_ipc/memory_output_stream.hpp"
 #include "sparrow_ipc/serializer.hpp"
 
-const std::filesystem::path arrow_testing_data_dir = ARROW_TESTING_DATA_DIR;
+#include "test_utils.hpp"
 
-const std::filesystem::path tests_resources_files_path = arrow_testing_data_dir / "data" / "arrow-ipc-stream"
-                                                         / "integration" / "cpp-21.0.0";
+const std::filesystem::path tests_resources_files_path = sparrow_ipc::test_utils::arrow_testing_data_dir / "data"
+                                                        / "arrow-ipc-stream" / "integration" / "cpp-21.0.0";
 
-const std::filesystem::path tests_resources_files_path_with_compression = arrow_testing_data_dir / "data"
-                                                                          / "arrow-ipc-stream" / "integration"
-                                                                          / "2.0.0-compression";
+const std::filesystem::path tests_resources_files_path_with_compression = sparrow_ipc::test_utils::arrow_testing_data_dir / "data"
+                                                                         / "arrow-ipc-stream" / "integration"
+                                                                         / "2.0.0-compression";
 
 const std::vector<std::filesystem::path> files_paths_to_test = {
     tests_resources_files_path / "generated_primitive",
@@ -82,27 +80,6 @@ const std::vector<std::filesystem::path> files_paths_to_test_with_zstd_compressi
 constexpr std::string_view canonical_map_entries = "entries";
 constexpr std::string_view canonical_map_key = "key";
 constexpr std::string_view canonical_map_value = "value";
-
-size_t get_number_of_batches(const std::filesystem::path& json_path)
-{
-    std::ifstream json_file(json_path);
-    if (!json_file.is_open())
-    {
-        throw std::runtime_error("Could not open file: " + json_path.string());
-    }
-    const nlohmann::json data = nlohmann::json::parse(json_file);
-    return data["batches"].size();
-}
-
-nlohmann::json load_json_file(const std::filesystem::path& json_path)
-{
-    std::ifstream json_file(json_path);
-    if (!json_file.is_open())
-    {
-        throw std::runtime_error("Could not open file: " + json_path.string());
-    }
-    return nlohmann::json::parse(json_file);
-}
 
 void compare_names(
     std::optional<std::string_view> opt_name1,
@@ -317,6 +294,19 @@ void compare_layouts(
     {
         compare_layouts(children1[i], children2[i]);
     }
+
+    // Recursively compare dictionary if present
+    const auto opt_dict1 = arr1.dictionary();
+    const auto opt_dict2 = arr2.dictionary();
+    if (opt_dict1.has_value())
+    {
+        REQUIRE(opt_dict2.has_value());
+        compare_layouts(opt_dict1.value(), opt_dict2.value());
+    }
+    else
+    {
+        CHECK_FALSE(opt_dict2.has_value());
+    }
 }
 
 void compare_record_batches(
@@ -344,6 +334,25 @@ void compare_record_batches(
                 const auto& column_1_value = column_1[z];
                 const auto& column_2_value = column_2[z];
                 CHECK_EQ(column_1_value, column_2_value);
+            }
+
+            // Explicitly compare dictionary values if present
+            // The row-by-row loop above only checks dictionary values that are actually
+            // referenced by indices in the current batch. This recursive call ensures
+            // that every single value in the dictionary source is semantically identical,
+            // including entries that might not be used in this specific record batch.
+            const auto opt_dict1 = column_1.dictionary();
+            const auto opt_dict2 = column_2.dictionary();
+            if (opt_dict1.has_value())
+            {
+                REQUIRE(opt_dict2.has_value());
+                const std::vector<sparrow::record_batch> dict_rb1 = {sparrow::record_batch({{"dict", opt_dict1.value()}})};
+                const std::vector<sparrow::record_batch> dict_rb2 = {sparrow::record_batch({{"dict", opt_dict2.value()}})};
+                compare_record_batches(dict_rb1, dict_rb2);
+            }
+            else
+            {
+                CHECK_FALSE(opt_dict2.has_value());
             }
 
             // Additional check for buffer layout for view data types
@@ -452,10 +461,10 @@ TEST_SUITE("Integration tests")
             SUBCASE(test_name.c_str())
             {
                 // Load the JSON file
-                auto json_data = load_json_file(json_path);
+                auto json_data = sparrow_ipc::test_utils::load_json_file(json_path);
                 CHECK(json_data != nullptr);
 
-                const size_t num_batches = get_number_of_batches(json_path);
+                const size_t num_batches = sparrow_ipc::test_utils::get_number_of_batches(json_data);
                 std::vector<sparrow::record_batch> record_batches_from_json;
                 for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx)
                 {
@@ -518,10 +527,10 @@ TEST_SUITE("Integration tests")
             SUBCASE(test_name.c_str())
             {
                 // Load the JSON file
-                auto json_data = load_json_file(json_path);
+                auto json_data = sparrow_ipc::test_utils::load_json_file(json_path);
                 CHECK(json_data != nullptr);
 
-                const size_t num_batches = get_number_of_batches(json_path);
+                const size_t num_batches = sparrow_ipc::test_utils::get_number_of_batches(json_data);
                 std::vector<sparrow::record_batch> record_batches_from_json;
                 for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx)
                 {
@@ -579,10 +588,10 @@ TEST_SUITE("Integration tests")
             json_path.replace_extension(".json");
 
             // Load the JSON file
-            auto json_data = load_json_file(json_path);
+            auto json_data = sparrow_ipc::test_utils::load_json_file(json_path);
             CHECK(json_data != nullptr);
 
-            const size_t num_batches = get_number_of_batches(json_path);
+            const size_t num_batches = sparrow_ipc::test_utils::get_number_of_batches(json_data);
             std::vector<sparrow::record_batch> record_batches_from_json;
             for (size_t batch_idx = 0; batch_idx < num_batches; ++batch_idx)
             {

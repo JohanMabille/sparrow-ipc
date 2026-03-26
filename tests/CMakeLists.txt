@@ -5,7 +5,7 @@ set(test_target "test_sparrow_ipc_lib")
 set(SPARROW_IPC_TESTS_SRC
     include/metadata_sample.hpp
     include/sparrow_ipc_tests_helpers.hpp
-    include/test_helper.hpp
+    include/test_utils.hpp
     main.cpp
     $<$<NOT:$<BOOL:${SPARROW_IPC_BUILD_SHARED}>>:test_flatbuffer_utils.cpp>
     test_any_output_stream.cpp
@@ -18,6 +18,7 @@ set(SPARROW_IPC_TESTS_SRC
     test_deserializer.cpp
     test_deserialize_utils.cpp
     test_dictionary_components.cpp
+    test_dictionary_ordered.cpp
     test_dictionary.cpp
     test_map_keys_sorted.cpp
     test_memory_output_streams.cpp
@@ -85,6 +86,11 @@ if(WIN32)
         COMMENT "Copying required DLLs to executable directory"
     )
 endif()
+
+target_compile_definitions(${test_target}
+    PRIVATE
+        SPARROW_IPC_TESTS_DATA_DIR="${CMAKE_CURRENT_SOURCE_DIR}/data"
+)
 
 target_include_directories(${test_target}
     PRIVATE
