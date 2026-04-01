@@ -46,30 +46,6 @@ namespace sparrow_ipc
     );
 
     /**
-     * @brief Deserializes Arrow IPC file format into a vector of record batches.
-     *
-     * Reads an Arrow IPC file format which consists of:
-     * 1. Magic bytes "ARROW1" with padding (8 bytes)
-     * 2. Stream format data (schema + record batches)
-     * 3. Footer containing metadata
-     * 4. Footer size (int32)
-     * 5. Trailing magic bytes "ARROW1" (6 bytes)
-     *
-     * @param data A span of bytes containing the serialized Arrow IPC file data
-     *
-     * @return std::vector<sparrow::record_batch> A vector containing all deserialized record batches
-     *
-     * @throws std::runtime_error If:
-     *         - The file magic bytes are incorrect
-     *         - The footer is missing or invalid
-     *         - Record batch deserialization fails
-     *
-     * @note The function validates the file structure including magic bytes at both start and end
-     */
-    [[nodiscard]] SPARROW_IPC_API std::vector<sparrow::record_batch>
-    deserialize_file(std::span<const uint8_t> data);
-
-    /**
      * @brief A class for serializing Apache Arrow record batches to the IPC file format.
      *
      * The stream_file_serializer class provides functionality to serialize single or multiple
@@ -108,6 +84,39 @@ namespace sparrow_ipc
             : m_stream(stream)
             , m_compression(compression)
         {
+        }
+
+        /**
+         * @brief Constructs a stream_file_serializer object with a reference to a stream and a schema.
+         *
+         * This constructor allows establishing the schema for the file immediately, which is
+         * useful when the number of record batches is zero or when the schema is known upfront.
+         *
+         * @tparam TStream The type of the stream to be used for serialization.
+         * @param stream Reference to the stream object that will be used for serialization operations.
+         * @param schema_batch A record batch containing the schema for the file. The data in this
+         *                     batch is NOT written to the file; only its schema is used.
+         * @param compression Optional compression type to apply to record batch bodies.
+         */
+        template <writable_stream TStream>
+        stream_file_serializer(
+            TStream& stream,
+            const sparrow::record_batch& schema_batch,
+            std::optional<CompressionType> compression = std::nullopt
+        )
+            : m_stream(stream)
+            , m_compression(compression)
+        {
+            // Write file header magic
+            m_stream.write(arrow_file_header_magic);
+            m_stream.add_padding();
+            m_header_written = true;
+
+            // Establish schema
+            m_schema_received = true;
+            m_first_record_batch = schema_batch;
+            m_dtypes = get_column_dtypes(schema_batch);
+            serialize_schema_message(schema_batch, m_stream);
         }
 
         /**

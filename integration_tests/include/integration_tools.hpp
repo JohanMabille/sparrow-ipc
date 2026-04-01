@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <span>
 #include <vector>
 
@@ -10,6 +11,16 @@
 
 namespace integration_tools
 {
+    /**
+     * @brief Parses a JSON file from the specified path.
+     *
+     * @param json_path The filesystem path to the input JSON file to be parsed.
+     * @return nlohmann::json The parsed JSON object.
+     *
+     * @throws std::runtime_error If the file cannot be opened or parsed.
+     */
+    nlohmann::json parse_json_file(const std::filesystem::path& json_path);
+
     /**
      * @brief Converts a JSON file to Arrow IPC file format.
      *
@@ -47,10 +58,14 @@ namespace integration_tools
      * @brief Reads an Arrow IPC stream and re-serializes it to file format.
      *
      * @param input_stream_data Binary Arrow IPC stream data
+     * @param schema_batch Optional record batch containing the schema (used if stream is empty)
      * @return Vector of bytes containing the re-serialized Arrow IPC file format stream
      * @throws std::runtime_error if the stream cannot be deserialized
      */
-    std::vector<uint8_t> stream_to_file(std::span<const uint8_t> input_stream_data);
+    std::vector<uint8_t> stream_to_file(
+        std::span<const uint8_t> input_stream_data,
+        std::optional<sparrow::record_batch> schema_batch = std::nullopt
+    );
 
     /**
      * @brief Reads an Arrow IPC file and re-serializes it to stream format.

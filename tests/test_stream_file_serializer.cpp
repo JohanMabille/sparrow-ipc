@@ -8,6 +8,7 @@
 #include <sparrow/dictionary_encoded_array.hpp>
 #include <sparrow/record_batch.hpp>
 
+#include "sparrow_ipc/deserialize.hpp"
 #include "sparrow_ipc/memory_output_stream.hpp"
 #include "sparrow_ipc/stream_file_serializer.hpp"
 #include "sparrow_ipc/magic_values.hpp"
@@ -64,10 +65,10 @@ TEST_SUITE("Stream file serializer tests")
         CHECK_EQ(file_data[trailing_offset + 5], '1');
 
         // Deserialize and verify
-        auto deserialized_batches = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
+        auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
 
-        REQUIRE_EQ(deserialized_batches.size(), 1);
-        const auto& deserialized_batch = deserialized_batches[0];
+        REQUIRE_EQ(deserialized.batches.size(), 1);
+        const auto& deserialized_batch = deserialized.batches[0];
         CHECK_EQ(deserialized_batch.nb_columns(), 2);
         CHECK_EQ(deserialized_batch.nb_rows(), 5);
         CHECK_EQ(deserialized_batch.names()[0], "int_col");
@@ -109,11 +110,11 @@ TEST_SUITE("Stream file serializer tests")
         // Deserialize and verify
         auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
 
-        REQUIRE_EQ(deserialized.size(), 3);
+        REQUIRE_EQ(deserialized.batches.size(), 3);
 
         for (size_t batch_idx = 0; batch_idx < 3; ++batch_idx)
         {
-            const auto& batch = deserialized[batch_idx];
+            const auto& batch = deserialized.batches[batch_idx];
             CHECK_EQ(batch.nb_columns(), 1);
             CHECK_EQ(batch.nb_rows(), 10);
 
@@ -163,9 +164,9 @@ TEST_SUITE("Stream file serializer tests")
         // Deserialize and verify
         auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
 
-        REQUIRE_EQ(deserialized.size(), 2);
-        CHECK_EQ(deserialized[0].nb_rows(), 3);
-        CHECK_EQ(deserialized[1].nb_rows(), 3);
+        REQUIRE_EQ(deserialized.batches.size(), 2);
+        CHECK_EQ(deserialized.batches[0].nb_rows(), 3);
+        CHECK_EQ(deserialized.batches[1].nb_rows(), 3);
     }
 
     TEST_CASE("File serialization with compression")
@@ -200,8 +201,8 @@ TEST_SUITE("Stream file serializer tests")
                 // Deserialize and verify
                 auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(compressed_data));
 
-                REQUIRE_EQ(deserialized.size(), 1);
-                const auto& deserialized_batch = deserialized[0];
+                REQUIRE_EQ(deserialized.batches.size(), 1);
+                const auto& deserialized_batch = deserialized.batches[0];
                 CHECK_EQ(deserialized_batch.nb_rows(), 100);
 
                 const auto& col = deserialized_batch.get_column(0);
@@ -243,18 +244,47 @@ TEST_SUITE("Stream file serializer tests")
 
         // Verify file is valid
         auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
-        REQUIRE_EQ(deserialized.size(), 1);
-        CHECK_EQ(deserialized[0].nb_rows(), 5);
+        REQUIRE_EQ(deserialized.batches.size(), 1);
+        CHECK_EQ(deserialized.batches[0].nb_rows(), 5);
     }
 
-    TEST_CASE("Error: explicit end without writing batches")
+    TEST_CASE("File serialization with schema only (zero batches)")
+    {
+        std::vector<std::string> names = {"int_col", "float_col"};
+        std::vector<int32_t> int_data = {};
+        sparrow::primitive_array<int32_t> int_array(std::move(int_data));
+        std::vector<float> float_data = {};
+        sparrow::primitive_array<float> float_array(std::move(float_data));
+        std::vector<sparrow::array> arrays;
+        arrays.emplace_back(std::move(int_array));
+        arrays.emplace_back(std::move(float_array));
+        sparrow::record_batch schema_batch(names, std::move(arrays));
+
+        std::vector<uint8_t> file_data;
+        sparrow_ipc::memory_output_stream mem_stream(file_data);
+
+        {
+            sparrow_ipc::stream_file_serializer serializer(mem_stream, schema_batch);
+            serializer.end();
+        }
+
+        // Verify file structure
+        REQUIRE(file_data.size() >= 18);
+        CHECK_EQ(file_data[0], 'A');
+
+        // Deserialize and verify
+        auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
+        CHECK_EQ(deserialized.batches.size(), 0);
+    }
+
+    TEST_CASE("Error: explicit end without schema")
     {
         std::vector<uint8_t> file_data;
         sparrow_ipc::memory_output_stream mem_stream(file_data);
         
-        // Explicitly calling end() without writing batches should throw
+        // Explicitly calling end() without schema should throw
         sparrow_ipc::stream_file_serializer serializer(mem_stream);
-        CHECK_THROWS_AS(serializer.end(), std::runtime_error);
+        CHECK_THROWS_WITH_AS(serializer.end(), "Cannot end file serializer without a schema", std::runtime_error);
     }
 
     TEST_CASE("Error: write after end")
@@ -268,11 +298,11 @@ TEST_SUITE("Stream file serializer tests")
 
         std::vector<uint8_t> file_data;
         sparrow_ipc::memory_output_stream mem_stream(file_data);
-        
+
         sparrow_ipc::stream_file_serializer serializer(mem_stream);
         serializer << batch;
         serializer.end();
-        
+
         CHECK_THROWS_AS(serializer.write(batch), std::runtime_error);
     }
 
@@ -506,12 +536,12 @@ TEST_SUITE("Stream file serializer tests")
 
         // Verify deserialize_file can read the file correctly
         auto deserialized = sparrow_ipc::deserialize_file(std::span<const uint8_t>(file_data));
-        REQUIRE_EQ(deserialized.size(), 3);
+        REQUIRE_EQ(deserialized.batches.size(), 3);
         
         // Check row counts match
-        CHECK_EQ(deserialized[0].nb_rows(), 5);
-        CHECK_EQ(deserialized[1].nb_rows(), 8);
-        CHECK_EQ(deserialized[2].nb_rows(), 11);
+        CHECK_EQ(deserialized.batches[0].nb_rows(), 5);
+        CHECK_EQ(deserialized.batches[1].nb_rows(), 8);
+        CHECK_EQ(deserialized.batches[2].nb_rows(), 11);
     }
 
     TEST_CASE("Footer schema matches record batch schema")
