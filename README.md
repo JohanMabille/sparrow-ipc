@@ -18,8 +18,15 @@
 
 ## Installation
 
+### Using a package manager
 
-### Install from sources
+Use your favorite package manager, `mamba`, `pixi` or `conda`, to install `sparrow-ipc` from `conda-forge`:
+
+```bash
+mamba install -c conda-forge sparrow-ipc
+```
+
+### Install from source
 
 `sparrow-ipc` has a few dependencies that you can install in a mamba environment:
 
@@ -32,7 +39,7 @@ You can then create a build directory, and build the project and install it with
 
 ```bash
 mkdir build
-de build
+cd build
 cmake .. \
     -DCMAKE_BUILD_TYPE=Debug \
           -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX \
@@ -40,6 +47,7 @@ cmake .. \
           -DSPARROW_IPC_BUILD_TESTS=ON \
           -DSPARROW_IPC_BUILD_EXAMPLES=ON
 
+make
 make install
 ```
 
