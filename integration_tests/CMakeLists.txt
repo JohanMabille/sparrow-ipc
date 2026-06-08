@@ -148,6 +148,7 @@ target_link_libraries(test_integration_tools
         integration_tools
         doctest::doctest
         arrow-testing-data
+        flatbuffers::flatbuffers
 )
 
 target_include_directories(test_integration_tools
@@ -155,6 +156,7 @@ target_include_directories(test_integration_tools
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${CMAKE_SOURCE_DIR}/include
         ${CMAKE_BINARY_DIR}/generated
+        ${CMAKE_SOURCE_DIR}/src
 )
 
 add_custom_target(run_test_integration_tools

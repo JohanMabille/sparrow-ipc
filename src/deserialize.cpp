@@ -12,12 +12,12 @@
 #include <sparrow/utils/mp_utils.hpp>
 #include <sparrow/utils/repeat_container.hpp>
 
-#include "sparrow_ipc/deserialize_utils.hpp"
+#include "detail/deserialize_utils.hpp"
 #include "sparrow_ipc/dictionary_cache.hpp"
-#include "sparrow_ipc/encapsulated_message.hpp"
-#include "sparrow_ipc/flatbuffer_utils.hpp"
+#include "detail/encapsulated_message.hpp"
+#include "detail/flatbuffer_utils.hpp"
 #include "sparrow_ipc/magic_values.hpp"
-#include "sparrow_ipc/metadata.hpp"
+#include "detail/metadata.hpp"
 
 namespace sparrow_ipc
 {

@@ -1,4 +1,4 @@
-#include "sparrow_ipc/deserialize_null_array.hpp"
+#include "detail/deserialize_null_array.hpp"
 
 #include <unordered_set>
 
